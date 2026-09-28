@@ -18,49 +18,18 @@ if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
 else:
     print("No hay CUDA disponible")
-# ===== Patch compatibilidad torchvision con torch NVIDIA Jetson (CUDA 12.6) =====
 
-# Patch 1: evita error al registrar operadores meta de torchvision
-import torch._library.fake_impl as _fake_impl_module
-_orig_fake_register = _fake_impl_module.FakeImplHolder.register
-def _patched_fake_register(self, func, source):
-    try:
-        return _orig_fake_register(self, func, source)
-    except RuntimeError:
-        return None
-_fake_impl_module.FakeImplHolder.register = _patched_fake_register
-
-# Patch 2: reemplaza torchvision.ops.nms con implementacion pura PyTorch
-#          (el .so de torchvision no es compatible con el build NVIDIA)
-import torchvision.ops as _tv_ops
-def _nms_puro(boxes, scores, iou_threshold):
-    order = scores.argsort(descending=True)
-    keep = []
-    while order.numel() > 0:
-        i = order[0].item()
-        keep.append(i)
-        if order.numel() == 1:
-            break
-        xx1 = boxes[order[1:], 0].clamp(min=boxes[i, 0])
-        yy1 = boxes[order[1:], 1].clamp(min=boxes[i, 1])
-        xx2 = boxes[order[1:], 2].clamp(max=boxes[i, 2])
-        yy2 = boxes[order[1:], 3].clamp(max=boxes[i, 3])
-        inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
-        area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
-        areas = (boxes[order[1:], 2] - boxes[order[1:], 0]) * (boxes[order[1:], 3] - boxes[order[1:], 1])
-        iou = inter / (area_i + areas - inter)
-        order = order[1:][iou <= iou_threshold]
-    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
-_tv_ops.nms = _nms_puro
-
-# ============================================================================
 
 from ultralytics import YOLO
 from CamNavi2 import CamNavi2
 
 
 # ================= CONFIG =================
-SAVE_PATH = "/home/icam-540/Fotos_Botellas_modelo_1"
+SAVE_PATH = "/home/icam-540/best_botella_1_origen"
+SAVE_PATH_YOLO = "/home/icam-540/best_botella_1_yolo"
+
+PT_PATH     = "/home/icam-540/Proyectos/Proyecto_ICAM_540_Botellas/best_botella_1.pt"
+#ENGINE_PATH = "/home/icam-540/Proyectos/Proyecto_ICAM_540_Botellas/best_botella_1.engine"
 
 # Resolución cámara (reducida para mejor rendimiento)
 #WIDTH  = 1920
@@ -70,7 +39,7 @@ HEIGHT = 2160
 # Tamaño YOLO (pequeño = procesamiento rápido)
 YOLO_SIZE_W = 640 
 YOLO_SIZE_H = 480 
-YOLO_CONF = 0.5  # Confianza mínima (> 0.5 = más rápido)
+YOLO_CONF = 0.7  # Confianza mínima (> 0.5 = más rápido)
 
 MUESTRA_IMAGEN = False
 detection_event = threading.Event()
@@ -80,11 +49,26 @@ detection_event = threading.Event()
 frame_event = threading.Event()
 
 _frame_lock = threading.Lock()
+# =========================================
+#  Exporta a TensorRT Engine solo si no existe; de lo contrario carga directo
+#  OPTIMIZACIÓN 3: half=True genera engine FP16 → ~30-50% más rápido en Jetson Orin
+#if not Path(ENGINE_PATH).exists():
+ #   print(f"[YOLO] best.engine no encontrado — exportando desde {PT_PATH} ...")
+ #   _tmp = YOLO(PT_PATH)
+ #   _tmp.export(format="engine", device=0, half=True)  # FP16 para Jetson GPU
+ #   del _tmp
 
+model = YOLO(PT_PATH )
+
+# OPTIMIZACIÓN 4: Warmup del modelo — hace 1 inferencia dummy al arrancar
+# La primera inferencia real de TensorRT inicializa contextos CUDA internos (~500ms).
+# Con el warmup ese costo ocurre aquí y no en el primer trigger de producción.
+_dummy = np.zeros((YOLO_SIZE_H, YOLO_SIZE_W, 3), dtype=np.uint8)
+model(_dummy, verbose=False, half=True)
 print("✅ Modelo TensorRT calentado y listo")
 
 os.makedirs(SAVE_PATH, exist_ok=True)
-
+os.makedirs(SAVE_PATH_YOLO, exist_ok=True)
 image_arr = None
 resized_2 = None
 
@@ -183,14 +167,15 @@ def new_image_handler(sample):
         image_arr = img
 
     count_unidades += 1
-    print(f"✅ Contador: {count_unidades}")
+    # print(f"✅ Contador: {count_unidades}")
     if count_unidades == 1:
         bandera_Yolo = False
         count_unidades = 0
     else:
         bandera_Yolo = True
         image_arr = None
-    if contador_imagenes == 350:
+    
+    if contador_imagenes == 1000:
         contador_imagenes = 0
     # OPTIMIZACIÓN 2: notifica al loop principal que llegó un frame nuevo.
     # El loop deja de dormir inmediatamente en lugar de esperar el sleep fijo.
@@ -201,6 +186,15 @@ def save_detection(frame, nombre_img):
     try:
         cv2.imwrite(str(SAVE_PATH +"/"+ nombre_img), frame)
         print(f"✅ Detección guardada: {SAVE_PATH+  nombre_img}")
+        detection_event.set()
+    except Exception as e:
+        print(f"❌ Error al guardar: {e}")
+
+def save_detection_yolo(frame, nombre_img):
+    """Guarda imagen de detección"""
+    try:
+        cv2.imwrite(str(SAVE_PATH_YOLO +"/"+ nombre_img), frame)
+        print(f"✅ Detección guardada: {SAVE_PATH_YOLO+  nombre_img}")
         detection_event.set()
     except Exception as e:
         print(f"❌ Error al guardar: {e}")
@@ -256,9 +250,7 @@ if __name__ == '__main__':
     camera.hw_trigger_delay = 0
     print("Delay " + str(camera.hw_trigger_delay))
 
-    camera.lighting.selector = 3
-
-    camera.lighting.gain = 100
+   
      #camera.lighting.selector = int(lista_confi[0])
 
      #camera.lighting.gain = int(lista_confi[1])
@@ -268,25 +260,26 @@ if __name__ == '__main__':
     #cn2.advcam_set_img_sharpness(camera, int(lista_confi[4]))
     ##cn2.advcam_set_img_brightness(camera,  int(lista_confi[5]))
     #cn2.advcam_set_img_gain(camera, int(lista_confi[6]))
-    
-    camera.image.saturation = 208
-    camera.image.gamma = 60
+    camera.lighting.selector = 3
+    camera.lighting.gain =    50                                                                                          
+    camera.image.saturation = 119
+    camera.image.gamma = 40
         
-    cn2.advcam_set_img_sharpness(camera, 100)
-    cn2.advcam_set_img_brightness(camera, 20)
-    cn2.advcam_set_img_gain(camera, 6)
+    cn2.advcam_set_img_sharpness(camera, 15)
+    cn2.advcam_set_img_brightness(camera, 40)
+    cn2.advcam_set_img_gain(camera, 8)
     camera.focus.pos_zero()
     print("Exposición actual:", camera.image.exposure_time)
     camera.image.exposure_time = int(10)
     print("Exposición nueva:", camera.image.exposure_time)
     
-    camera.focus.distance = 60
+    camera.focus.distance = 10
     #camera.focus.distance = int(lista_confi[7])
     #contador_imagenes = int(lista_confi[8])
     contador_imagenes = 0
     print("lens motor posistion: ", camera.focus.position())
     i = 0
-    while i < 6:
+    while i < 7:
             camera.focus.direction = 1 # lens focusing motor backward
             try:
                 camera.focus.distance = 100
@@ -296,23 +289,22 @@ if __name__ == '__main__':
                 print("valor ", i)
             except ValueError:
                 print("lens position out of index")
-    camera.focus.direction = 1
-    camera.focus.distance = 10
-     
+     #camera.focus.distance = 10
+     #camera.focus.direction = 1
      #print("lens motor posistion: ", camera.focus.position())
     # ---------- START STREAM ----------
-   
     cn2.advcam_play(camera)
 
     print("✅ iCAM-540 listo. Esperando trigger hardware en PIN 10...")
     ultimo_frame = None
     frame_yolo = None
     resized = None
+    bandera_cv = False
     try:
         while True:
             # OPTIMIZACIÓN 2: espera hasta que llegue un frame nuevo (máx 500ms)
                 # Reemplaza el time.sleep(0.1) fijo — el loop despierta exacto con el trigger
-            frame_event.wait(timeout=0.5)
+            frame_event.wait(timeout=0.1)
             frame_event.clear()
 
 
@@ -328,10 +320,65 @@ if __name__ == '__main__':
                 except Exception:
                  pass
                 
-                contador_imagenes+=1
-                nombre_ig = "foto_" +str(contador_imagenes) + ".png"
-                save_detection(resized, nombre_ig)
-                cv2.imshow("Vista Camara",resized)
+
+                if bandera_Yolo == False:
+                    # OPTIMIZACIÓN 3: half=True activa inferencia FP16 en cada frame
+                    # Aprovecha el engine compilado con half=True → menor latencia por inferencia
+                    results = model(resized, verbose=False, conf=YOLO_CONF, half=True)
+
+                    frame_yolo = results[0].plot()
+                    bandera_Yolo = True
+                    resized_2 = resized.copy() 
+                    contador_imagenes+=1
+                    nombre_ig = "foto_" +str(contador_imagenes) + ".png"
+                    save_detection(resized, nombre_ig)
+                    save_detection_yolo(frame_yolo, nombre_ig)
+
+                    for i,cls_id in enumerate(results[0].boxes.cls.tolist()):
+                        class_name = results[0].names[int(cls_id)]
+                        if class_name == "M":
+                            count_malo+=1
+                            count_rechazo = 0
+                            h, w = frame_yolo.shape[:2]
+
+                            banner_h = 80
+
+                            # Banner semitransparente en la parte superior
+                            #overlay = frame_yolo.copy()
+                            #cv2.rectangle(overlay, (0, 0), (w, banner_h), (0, 0, 255), -1)
+                            #alpha = 0.2
+                            #cv2.addWeighted(overlay, alpha, frame_yolo, 1 - alpha, 0, frame_yolo)
+
+                            # Texto "DEFECTO" centrado dentro de la bounding box
+                            x1, y1, x2, y2 = results[0].boxes.xyxy[i].tolist()
+                            cx = int((x1 + x2) / 2)
+                            cy = int((y1 + y2) / 2)
+                            texto = "DEFECTO"
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            font_scale = 1.2
+                            thickness = 3
+                            (tw, th), baseline = cv2.getTextSize(texto, font, font_scale, thickness)
+                            tx = cx - tw // 2
+                            ty = cy + th // 2
+                            cv2.putText(frame_yolo, texto, (tx, ty), font, font_scale, (0, 0, 255), thickness, cv2.LINE_AA)
+                        if class_name == "B":
+                            #print(f"🎯 Objeto detectado: {class_name}")
+                            count_bueno+=1
+                            
+                    if bandera_cv == False:
+                        cv2.namedWindow("Vista Camara", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
+                        cv2.resizeWindow("Vista Camara", WIDTH, HEIGHT)
+                        bandera_cv = True
+
+                    frame_yolo_resized = cv2.resize(frame_yolo, (WIDTH, HEIGHT))
+                    
+
+                    cv2.imshow("Vista Camara", frame_yolo_resized)
+                    #cv2.imshow("Vista Camara",frame_yolo)
+                    
+                    actualizar_linea_archivo(linea_cero,count_bueno)
+                    actualizar_linea_archivo(linea_uno,count_malo)
+                    print(f"ELECTRODO BUENO :{count_bueno}, MALO {count_malo}")
 
                 key = cv2.waitKey(1) & 0xFF
 
@@ -492,8 +539,8 @@ if __name__ == '__main__':
                 if resized is not None  and frame_yolo is None:
                     ultimo_frame = resized.copy()
 
-                if ultimo_frame is not None :
-                    cv2.imshow("Vista Camara",ultimo_frame)
+                #if ultimo_frame is not None :
+                    #cv2.imshow("Vista Camara",ultimo_frame)
 
                 key = cv2.waitKey(1) & 0xFF
 

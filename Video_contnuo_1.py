@@ -24,40 +24,6 @@ if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
 else:
     print("No hay CUDA disponible")
-# ===== Patch compatibilidad torchvision con torch NVIDIA Jetson (CUDA 12.6) =====
-
-# Patch 1: evita error al registrar operadores meta de torchvision
-import torch._library.fake_impl as _fake_impl_module
-_orig_fake_register = _fake_impl_module.FakeImplHolder.register
-def _patched_fake_register(self, func, source):
-    try:
-        return _orig_fake_register(self, func, source)
-    except RuntimeError:
-        return None
-_fake_impl_module.FakeImplHolder.register = _patched_fake_register
-
-# Patch 2: reemplaza torchvision.ops.nms con implementacion pura PyTorch
-#          (el .so de torchvision no es compatible con el build NVIDIA)
-import torchvision.ops as _tv_ops
-def _nms_puro(boxes, scores, iou_threshold):
-    order = scores.argsort(descending=True)
-    keep = []
-    while order.numel() > 0:
-        i = order[0].item()
-        keep.append(i)
-        if order.numel() == 1:
-            break
-        xx1 = boxes[order[1:], 0].clamp(min=boxes[i, 0])
-        yy1 = boxes[order[1:], 1].clamp(min=boxes[i, 1])
-        xx2 = boxes[order[1:], 2].clamp(max=boxes[i, 2])
-        yy2 = boxes[order[1:], 3].clamp(max=boxes[i, 3])
-        inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
-        area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
-        areas = (boxes[order[1:], 2] - boxes[order[1:], 0]) * (boxes[order[1:], 3] - boxes[order[1:], 1])
-        iou = inter / (area_i + areas - inter)
-        order = order[1:][iou <= iou_threshold]
-    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
-_tv_ops.nms = _nms_puro
 
 # ============================================================================
 
